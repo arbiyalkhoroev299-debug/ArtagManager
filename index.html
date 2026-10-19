@@ -63,18 +63,108 @@ function modal(h){const m=$('#mod');m.innerHTML='<div>'+h+'</div>';m.style.displ
 A.form=async(s,id)=>{const e=E[s];const v=id?(await all(s)).find(x=>x.id==id):{};
 modal('<h3>'+e.t+'</h3>'+e.f.map(([k,l,t,o])=>{const x=v[k]??'';return '<label>'+l+'</label>'+(t=='s'?'<select id="f_'+k+'">'+o.map(y=>'<option'+(y==x?' selected':'')+'>'+y+'</option>').join('')+'</select>':t=='a'?'<textarea rows=3 id="f_'+k+'">'+esc(x)+'</textarea>':'<input id="f_'+k+'" '+(t=='n'?'type=number step=any inputmode=decimal':t=='d'?'type=date':t=='t'?'type=time':'')+' value="'+esc(x)+'">')}).join('')+
 '<button onclick="A.save(\''+s+'\',\''+(id||'')+'\')">Сохранить</button><button class=g onclick=A.close()>Отмена</button>'+(id?'<button class=r onclick="A.del(\''+s+'\',\''+id+'\')">Удалить</button>':''))};
-A.save=async(s,id)=>{const e=E[s],old=id?(await all(s)).find(x=>x.id==id):null,v=old?{...old}:{id:uid(),created:Date.now()};
-for(const[k,,t]of e.f){let x=$('#f_'+k).value;if(t=='n')x=x===''?null:parseFloat(x);v[k]=x}
-if(!v[e.f[0][0]]){return alert('Заполните обязательное поле')}
-for(const k of['boxes','perBox','sqm'])if(v[k]!=null&&v[k]<0)return alert('Значение не может быть отрицательным');
-v.updated=Date.now();await put(s,v);
-if(s=='products'){const ob=old?old.boxes||0:0,nb=v.boxes||0;if(!old||ob!=nb)await log(v,ob,nb,old?'Ручное изменение':'Создание');if(old&&old.loc!=v.loc)await log(v,nb,nb,'Перемещение: '+(old.loc||'—')+' → '+(v.loc||'—'))}
-A.close();render()};
-A.del=async(s,id)=>{if(confirm('Удалить запись? Действие необратимо.')){await del(s,id);A.close();render()}};
-const log=(p,a,b,n)=>put('logs',{id:uid(),ts:Date.now(),pid:p.id,name:p.name,from:a,to:b,note:n});
-A.adj=async(id,d)=>{const p=(await all('products')).find(x=>x.id==id),a=p.boxes||0,b=a+d;if(b<0)return alert('Нельзя списать больше остатка: на складе '+a+' кор.');
-p.boxes=b;p.updated=Date.now();await put('products',p);await log(p,a,b,d>0?'Приход':'Списание');drawStock()};
-const area=p=>p.sqm&&p.boxes!=null?p.boxes*p.sqm:null;
+
+A.save=async(s,id)=>{
+  const e=E[s];
+  const old=id?(await all(s)).find(x=>x.id==id):null;
+  const v=old?{...old}:{id:uid(),created:Date.now()};
+
+  for(const[k,,t]of e.f){
+    let x=$('#f_'+k).value;
+    if(t=='n')x=x===''?null:parseFloat(x);
+    v[k]=x;
+  }
+
+  if(!v[e.f[0][0]])return alert('Заполните обязательное поле');
+
+  for(const k of ['boxes','perBox','sqm']){
+    if(v[k]!=null&&v[k]<0)return alert('Значение не может быть отрицательным');
+  }
+
+  if(s==='products'&&v.sku&&
+    (await all('products')).some(x=>x.id!==v.id&&x.sku===v.sku)){
+    return alert('Такой артикул уже есть в локальной базе.');
+  }
+
+  v.updated=Date.now();
+
+  if(s==='products'){
+    const ob=Number(old?.boxes)||0;
+    const nb=Number(v.boxes)||0;
+
+    // Если товар уже связан с облаком, сначала сохраняем его карточку.
+    // Изменение остатка проводится отдельно через журнал движений.
+    if(v.sku){
+      try{
+        const saved=await cloudSaveProduct(v);
+        v.cloudId=saved.id;
+
+        const delta=nb-ob;
+        if(delta>0)await cloudAdjust(v.sku,'receipt',delta,'Изменение остатка в ARTAG');
+        if(delta<0)await cloudAdjust(v.sku,'writeoff',-delta,'Изменение остатка в ARTAG');
+      }catch(err){
+        return alert('Не удалось сохранить товар в облаке.\n'+err.message+'\nЛокальные данные не изменены.');
+      }
+    }
+
+    await put(s,v);
+
+    if(!old||ob!==nb)await log(v,ob,nb,old?'Ручное изменение':'Создание');
+    if(old&&old.loc!==v.loc)await log(v,nb,nb,'Перемещение: '+(old.loc||'—')+' → '+(v.loc||'—'));
+  }else{
+    await put(s,v);
+  }
+
+  A.close();
+  render();
+};
+
+A.del=async(s,id)=>{
+  if(!confirm('Удалить запись? Действие необратимо.'))return;
+
+  if(s==='products'){
+    const p=(await all('products')).find(x=>x.id==id);
+    if(p?.cloudId){
+      try{
+        await cloud('products.delete',{id:p.cloudId});
+      }catch(err){
+        return alert('Не удалось удалить товар из облака.\n'+err.message);
+      }
+    }
+  }
+
+  await del(s,id);
+  A.close();
+  render();
+};
+
+A.adj=async(id,d)=>{
+  const p=(await all('products')).find(x=>x.id==id);
+  if(!p)return;
+
+  const a=Number(p.boxes)||0;
+  const b=a+d;
+  if(b<0)return alert('Нельзя списать больше остатка: на складе '+a+' кор.');
+
+  if(p.cloudId){
+    try{
+      await cloudAdjust(
+        p.sku,
+        d>0?'receipt':'writeoff',
+        Math.abs(d),
+        d>0?'Приход через ARTAG':'Списание через ARTAG'
+      );
+    }catch(err){
+      return alert('Остаток не изменён.\n'+err.message);
+    }
+  }
+
+  p.boxes=b;
+  p.updated=Date.now();
+  await put('products',p);
+  await log(p,a,b,d>0?'Приход':'Списание');
+  drawStock();
+};
 // ---- manager
 function calc(s,now=Date.now()){const e=s.events,i=e.find(x=>x.type=='in');if(!i)return{};let l=0,ls=null;for(const x of e){if(x.type=='ls')ls=x.ts;if(x.type=='le'&&ls!=null){l+=x.ts-ls;ls=null}}
 const o=e.find(x=>x.type=='out'),end=o?o.ts:now,cur=ls!=null&&!o?now-ls:0;return{inn:i.ts,out:o&&o.ts,lunch:l+cur,onL:ls!=null,work:end-i.ts-l-cur,inc:!o||ls!=null}}
@@ -170,7 +260,33 @@ async function render(){const v=st.page||st.tab;const an=v!=st.k;st.k=v;const ba
 $('#main').className=an?'anim':'';$('#main').innerHTML=(st.page?'<button class=g onclick="A.go(\''+(['orders','issues','tools','rep','logs','backup','set'].includes(st.page)?'more':st.tab)+'\')">‹ Назад</button>':'')+await V[v]();
 $('#nav').innerHTML=TABS.map(([k,l])=>'<div style="--tc:'+IC2[k][1]+'" class="'+((st.page?(['orders','issues','tools','rep','logs','backup','set'].includes(st.page)?'more':st.tab):st.tab)==k?'on':'')+'" onclick="A.go(\''+k+'\')">'+IC2[k][0]+'<span>'+l+'</span></div>').join('');if(an)cnt()}
 function cnt(){[...$('#main').children].forEach((c,i)=>c.style.animationDelay=Math.min(i*45,450)+'ms');document.querySelectorAll('.big').forEach(e=>{const n=+e.textContent;if(!/^\d+$/.test(e.textContent)||n<1)return;const t0=performance.now();(function f(t){const p=Math.min(1,(t-t0)/800);e.textContent=Math.round(n*(1-Math.pow(1-p,3)));if(p<1)requestAnimationFrame(f)})(t0)})}
-async function init(){await open();const c=(await all('settings')).find(x=>x.id=='cfg');if(c)st.cfg=c;$('#wn').textContent=st.cfg.name;render()}
+
+async function init(){
+  await open();
+
+  const c=(await all('settings')).find(x=>x.id=='cfg');
+  if(c)st.cfg=c;
+
+  $('#wn').textContent=st.cfg.name;
+  render();
+
+  if(window.Telegram?.WebApp?.initData){
+    try{
+      window.Telegram.WebApp.ready();
+      const result=await syncProducts();
+      $('#wn').textContent=st.cfg.name+' · облако';
+      render();
+
+      if(result.localOnly){
+        console.warn('Локальные товары без облачной связи:',result.localOnly);
+      }
+    }catch(err){
+      console.error('ARTAG cloud sync:',err);
+      $('#wn').textContent=st.cfg.name+' · ошибка облака';
+      alert('ARTAG запустился, но облачная синхронизация не удалась.\n'+err.message);
+    }
+  }
+}
 init();setInterval(()=>{if(!$('#mod').style.display||$('#mod').style.display=='none')if(['home','mgr'].includes(st.page||st.tab))render()},60000);
 if('serviceWorker'in navigator)navigator.serviceWorker.register('sw.js');
 </script></body></html>
